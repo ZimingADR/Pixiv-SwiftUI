@@ -27,12 +27,22 @@ jobs:
     name: Build iOS IPA (unsigned)
     runs-on: xcode-27
     timeout-minutes: 90
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
+
+      - name: Resolve revision
+        id: rev
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building $(git rev-parse --short HEAD) from $(git rev-parse --abbrev-ref HEAD)"
 
       - name: Prepare tag data
         shell: bash
@@ -185,16 +195,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REF: ${{ inputs.ref }}
+          BUILT_SHA: ${{ needs.build-ios.outputs.sha }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
-          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          short_sha="$(echo "${BUILT_SHA}" | cut -c1-7)"
           tag="ipa-${short_sha}-${RUN_NUMBER}"
           ipa="dist/Pixiv-SwiftUI.ipa"
 
           notes=$(printf '%s\n' \
-            "Unsigned IPA built from \`${REF}\` (${GITHUB_SHA})." \
+            "Unsigned IPA built from \`${REF}\` (${BUILT_SHA})." \
             "" \
             "- Bundle ID: \`${{ inputs.bundle_id }}\`" \
             "- Size: $(du -h "$ipa" | cut -f1)" \
