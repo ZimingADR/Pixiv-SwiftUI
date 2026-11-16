@@ -1,0 +1,210 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag or SHA of this repository)
+        required: false
+        default: master
+        type: string
+      bundle_id:
+        description: Bundle identifier override
+        required: false
+        default: org.eu.eslzzyl.Pixiv-SwiftUI
+        type: string
+      publish_release:
+        description: Publish the IPA as a prerelease asset
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Build iOS IPA (unsigned)
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Prepare tag data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p Resources
+          fallback='{"timestamp":"","tags":{}}'
+
+          # Resources/ is gitignored but tags.json is a required build input.
+          # Reuse the copy bundled in the latest upstream release; fall back to an empty table.
+          if curl -fsSL --retry 3 --retry-delay 2 \
+              -o "$RUNNER_TEMP/upstream.ipa" \
+              "https://github.com/Eslzzyl/Pixiv-SwiftUI/releases/latest/download/Pixiv-SwiftUI.ipa"; then
+            if unzip -o -q "$RUNNER_TEMP/upstream.ipa" "Payload/Pixiv-SwiftUI.app/tags.json" -d "$RUNNER_TEMP/upstream"; then
+              cp "$RUNNER_TEMP/upstream/Payload/Pixiv-SwiftUI.app/tags.json" Resources/tags.json
+            fi
+          fi
+
+          if [ ! -s Resources/tags.json ] || ! jq -e '.tags | type == "object"' Resources/tags.json >/dev/null 2>&1; then
+            printf '%s' "$fallback" > Resources/tags.json
+            echo "::warning::Falling back to an empty tags.json, tag translations will be unavailable."
+          fi
+
+          echo "tags.json size: $(wc -c < Resources/tags.json) bytes"
+          echo "tag count: $(jq -r '.tags | length' Resources/tags.json)"
+
+      - name: Cache Swift packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/derived_data/SourcePackages
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-${{ runner.arch }}-ios-spm-${{ hashFiles('Pixiv-SwiftUI.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-ios-spm-
+
+      - name: Build (Release, unsigned)
+        shell: bash
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+
+          log="$RUNNER_TEMP/xcodebuild-ios.log"
+          if ! xcodebuild \
+              -project Pixiv-SwiftUI.xcodeproj \
+              -scheme Pixiv-SwiftUI \
+              -sdk iphoneos \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/derived_data \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+              -skipPackagePluginValidation \
+              -jobs "$(sysctl -n hw.ncpu)" \
+              build > "$log" 2>&1; then
+            grep -E "error:|BUILD FAILED|The following build commands failed" "$log" || true
+            tail -n 300 "$log"
+            exit 1
+          fi
+
+          grep -E "BUILD SUCCEEDED" "$log" || true
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app=$(find build/derived_data/Build/Products/Release-iphoneos -maxdepth 1 -name 'Pixiv-SwiftUI.app' -type d | head -n 1)
+          test -n "$app"
+          test -f "$app/Pixiv-SwiftUI"
+
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$app" build/Payload/
+
+          (cd build && rm -f Pixiv-SwiftUI.ipa && zip -qry Pixiv-SwiftUI.ipa Payload)
+
+          echo "IPA: $(du -h build/Pixiv-SwiftUI.ipa | cut -f1)"
+          echo "SHA256: $(shasum -a 256 build/Pixiv-SwiftUI.ipa | cut -d' ' -f1)"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Info.plist"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: Pixiv-SwiftUI-unsigned-ipa
+          path: build/Pixiv-SwiftUI.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos:
+    name: Compile check (macOS)
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Prepare tag data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Resources
+          echo '{"timestamp":"","tags":{}}' > Resources/tags.json
+
+      - name: Build (Debug, macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          log="$RUNNER_TEMP/xcodebuild-macos.log"
+          if ! xcodebuild \
+              -project Pixiv-SwiftUI.xcodeproj \
+              -scheme Pixiv-SwiftUI \
+              -configuration Debug \
+              -destination 'platform=macOS' \
+              -derivedDataPath build/derived_data_macos \
+              CODE_SIGNING_ALLOWED=NO \
+              -skipPackagePluginValidation \
+              -jobs "$(sysctl -n hw.ncpu)" \
+              build > "$log" 2>&1; then
+            grep -E "error:|BUILD FAILED|The following build commands failed" "$log" || true
+            tail -n 300 "$log"
+            exit 1
+          fi
+
+          grep -E "BUILD SUCCEEDED" "$log" || true
+
+  publish:
+    name: Publish prerelease
+    needs: build-ios
+    if: ${{ inputs.publish_release }}
+    runs-on: xcode-27
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v7
+        with:
+          name: Pixiv-SwiftUI-unsigned-ipa
+          path: dist
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          tag="ipa-${short_sha}-${RUN_NUMBER}"
+          ipa="dist/Pixiv-SwiftUI.ipa"
+
+          notes=$(printf '%s\n' \
+            "Unsigned IPA built from \`${REF}\` (${GITHUB_SHA})." \
+            "" \
+            "- Bundle ID: \`${{ inputs.bundle_id }}\`" \
+            "- Size: $(du -h "$ipa" | cut -f1)" \
+            "- SHA256: \`$(shasum -a 256 "$ipa" | cut -d' ' -f1)\`" \
+            "" \
+            "Install with AltStore, SideStore or Sideloadly; the IPA is not signed.")
+
+          gh release create "$tag" "$ipa" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$REF" \
+            --title "Unsigned IPA ${tag}" \
+            --notes "$notes" \
+            --prerelease
