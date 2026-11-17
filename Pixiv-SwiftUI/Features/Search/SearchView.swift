@@ -28,6 +28,14 @@ struct SearchView: View {
         )
     }
 
+    private var isShowingSuggestions: Bool {
+        #if os(iOS)
+        !store.searchText.isEmpty && isSearchPresented
+        #else
+        false
+        #endif
+    }
+
     private func copyToClipboard(_ text: String) {
         #if canImport(UIKit)
         UIPasteboard.general.string = text
@@ -77,10 +85,18 @@ struct SearchView: View {
             GeometryReader { proxy in
                 VStack(spacing: 0) {
                 #if os(iOS)
-                if store.searchText.isEmpty || !isSearchPresented {
+                // 两套内容常驻并只切换可见性：输入首个字符时若替换视图层级，
+                // iOS 26 的搜索框会短暂失焦，中文输入法的候选会被打断。
+                ZStack {
                     searchHistoryAndTrends(containerWidth: proxy.size.width)
-                } else {
+                        .opacity(isShowingSuggestions ? 0 : 1)
+                        .allowsHitTesting(!isShowingSuggestions)
+                        .accessibilityHidden(isShowingSuggestions)
+
                     suggestionList
+                        .opacity(isShowingSuggestions ? 1 : 0)
+                        .allowsHitTesting(isShowingSuggestions)
+                        .accessibilityHidden(!isShowingSuggestions)
                 }
                 #else
                 searchHistoryAndTrends(containerWidth: proxy.size.width)
